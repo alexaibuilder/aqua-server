@@ -153,6 +153,17 @@ wss.on("connection", (ws) => {
         }, null);
         break;
       }
+      case "weather": {
+        // Host broadcasts their weather to everyone visiting them.
+        // We trust the host (they're the one whose room this is).
+        if (!ws.hostId || !ws.userId) return;
+        // Only forward weather if the sender IS the host of the room
+        if (ws.userId !== ws.hostId) return;
+        const w = msg.weather;
+        if (w !== "clear" && w !== "cloudy" && w !== "rain" && w !== "storm" && w !== "fog") return;
+        broadcast(ws.hostId, { type: "weather", weather: w }, ws);
+        break;
+      }
       case "ping": {
         send(ws, { type: "pong", ts: Date.now() });
         break;
