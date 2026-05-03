@@ -94,7 +94,7 @@ function sanitizeChat(text) {
   return t;
 }
 
-const VALID_ZIAM_STYLES = new Set(["fire", "ice", "light", "shadow", "earth", "ziamgod", "yuamb", "water"]);
+const VALID_ZIAM_STYLES = new Set(["fire", "ice", "light", "shadow", "earth", "ziamgod", "yuamb", "water", "gardenbloom"]);
 
 wss.on("connection", (ws) => {
   ws.userId = null;
