@@ -188,7 +188,13 @@ wss.on("connection", (ws) => {
         const damage = Math.min(150, Math.max(0, Number(msg.damage) || 0));
         const knockback = msg.knockback || { x: 0, z: 0, y: 0 };
         const attackId = String(msg.attackId || "punch").slice(0, 40);
-        if (!targetId || damage <= 0) return;
+        // Allow 0-damage hits IF they include knockback — supports pure
+        // displacement abilities like Wind Cyclone airborne launch and
+        // Wind air-jump blasts. Reject only if both damage and knockback are 0.
+        const hasKnockback = (Number(knockback.x) || 0) !== 0 ||
+                             (Number(knockback.y) || 0) !== 0 ||
+                             (Number(knockback.z) || 0) !== 0;
+        if (!targetId || (damage <= 0 && !hasKnockback)) return;
         const set = rooms.get(ws.roomId);
         if (!set) return;
         for (const peer of set) {
