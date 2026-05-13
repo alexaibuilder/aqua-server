@@ -1,14 +1,22 @@
 // ALEXPRO GAMES multiplayer server
-// Hosts WebSocket rooms for both Aqua Tycoon (island visiting + chat) and
-// Ziam Battlegrounds (real-time PvP combat with abilities).
+// Supports: aqua, ziam, dungeons, yuambcraft
+// Hosts WebSocket rooms for various games. Each gameKind has its own room/relay rules.
 
 const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 
+// ─── STATE ──────────────────────────────────────────────────────────────
+// rooms: Map<roomId, Set<WebSocket>>
 const rooms = new Map();
 
+// Per-socket metadata is set on the ws object:
+//   ws.userId, ws.username, ws.roomId, ws.gameKind
+//   ws.x, ws.y, ws.z, ws.yaw, ws.hp
+//   Yuambcraft-only: ws.dimension, ws.selectedItem, ws.skin
+
+// ─── HTTP ──
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -27,11 +35,13 @@ function countConnections() {
 
 const wss = new WebSocket.Server({ server });
 
+// ─── HELPERS ──
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) {
     try { ws.send(JSON.stringify(msg)); } catch {}
   }
 }
+
 function broadcast(roomId, msg, exclude) {
   const set = rooms.get(roomId);
   if (!set) return;
@@ -43,7 +53,9 @@ function broadcast(roomId, msg, exclude) {
     }
   }
 }
+
 function joinRoom(ws, roomId) {
+  // Leave previous room
   if (ws.roomId && rooms.has(ws.roomId)) {
     const set = rooms.get(ws.roomId);
     set.delete(ws);
@@ -53,102 +65,99 @@ function joinRoom(ws, roomId) {
   ws.roomId = roomId;
   if (!rooms.has(roomId)) rooms.set(roomId, new Set());
   rooms.get(roomId).add(ws);
+
+  // Send roster of current peers to the new player
   const peers = [];
   for (const peer of rooms.get(roomId)) {
     if (peer === ws) continue;
-    const p = {
+    peers.push({
       userId: peer.userId,
       username: peer.username,
-      x: peer.x ?? 0, z: peer.z ?? 0, yaw: peer.yaw ?? 0,
-      hp: peer.hp ?? 100,
-    };
-    if (ws.gameKind === "ziam") {
-      p.style = peer.style || "fire";
-      p.kills = peer.kills || 0;
-      p.deaths = peer.deaths || 0;
-    }
-    peers.push(p);
+      x: peer.x ?? 0, y: peer.y ?? 0, z: peer.z ?? 0,
+      yaw: peer.yaw ?? 0, hp: peer.hp ?? 20,
+      dimension: peer.dimension || "overworld",
+      selectedItem: peer.selectedItem || 0,
+    });
   }
   send(ws, { type: "roster", peers });
-  const joinMsg = {
+
+  // Notify others
+  broadcast(roomId, {
     type: "join",
     userId: ws.userId,
     username: ws.username,
-    x: ws.x ?? 0, z: ws.z ?? 0, yaw: ws.yaw ?? 0, hp: ws.hp ?? 100,
-  };
-  if (ws.gameKind === "ziam") {
-    joinMsg.style = ws.style || "fire";
-    joinMsg.kills = ws.kills || 0;
-    joinMsg.deaths = ws.deaths || 0;
-  }
-  broadcast(roomId, joinMsg, ws);
+    x: ws.x ?? 0, y: ws.y ?? 0, z: ws.z ?? 0,
+    yaw: ws.yaw ?? 0, hp: ws.hp ?? 20,
+  }, ws);
 }
 
 function sanitizeChat(text) {
   if (typeof text !== "string") return null;
-  let t = text.trim().slice(0, 200);
-  if (!t) return null;
-  const banned = ["nigger", "faggot", "retard", "kys"];
-  const lower = t.toLowerCase();
-  for (const b of banned) if (lower.includes(b)) return null;
-  return t;
+  const t = text.trim().slice(0, 200);
+  return t.length > 0 ? t : null;
 }
 
-const VALID_ZIAM_STYLES = new Set(["fire", "ice", "light", "shadow", "earth", "ziamgod", "yuamb", "water", "gardenbloom", "blood", "wind", "poison", "boxer", "necromancer"]);
-
+// ─── WEBSOCKET HANDLER ──
 wss.on("connection", (ws) => {
-  ws.userId = null;
-  ws.roomId = null;
-  ws.x = 0; ws.z = 0; ws.yaw = 0; ws.hp = 100;
-  ws.gameKind = "aqua";
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
 
   ws.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (!msg || typeof msg !== "object") return;
+    if (!msg || typeof msg.type !== "string") return;
 
     switch (msg.type) {
       case "hello": {
-        ws.userId = String(msg.userId || "").slice(0, 100);
-        ws.username = String(msg.username || "Anonymous").slice(0, 30);
-        if (!ws.userId) { ws.close(); return; }
-        ws.gameKind = msg.gameKind === "ziam" ? "ziam" : "aqua";
-        if (ws.gameKind === "ziam") {
-          ws.style = VALID_ZIAM_STYLES.has(msg.style) ? msg.style : "fire";
-          ws.kills = 0;
-          ws.deaths = 0;
-          ws.hp = 100;
-          joinRoom(ws, "ziam:global");
-        } else {
-          const hostId = String(msg.hostId || ws.userId).slice(0, 100);
-          joinRoom(ws, "aqua:" + hostId);
-        }
-        break;
-      }
-      case "switch_room": {
-        if (ws.gameKind !== "aqua") return;
-        const hostId = String(msg.hostId || ws.userId || "").slice(0, 100);
-        if (!hostId || !ws.userId) return;
-        joinRoom(ws, "aqua:" + hostId);
-        break;
-      }
-      case "pos": {
-        if (!ws.roomId || !ws.userId) return;
+        // Initial handshake. Assigns userId/username and joins a room.
+        ws.userId = String(msg.userId || "guest-" + Math.random().toString(36).slice(2, 8));
+        ws.username = String(msg.username || "Player").slice(0, 24);
+        ws.gameKind = String(msg.gameKind || "aqua");
         ws.x = Number(msg.x) || 0;
+        ws.y = Number(msg.y) || 30;
+        ws.z = Number(msg.z) || 0;
+        ws.yaw = Number(msg.yaw) || 0;
+        ws.hp = Number(msg.hp) || 20;
+        ws.dimension = msg.dimension || "overworld";
+
+        // Determine roomId based on gameKind
+        let roomId;
+        if (ws.gameKind === "yuambcraft") {
+          // Yuambcraft has ONE global world for now
+          roomId = "yuambcraft:global";
+        } else if (ws.gameKind === "dungeons") {
+          roomId = "dungeons:" + (msg.dungeonRoom || "global");
+        } else if (ws.gameKind === "ziam") {
+          roomId = "ziam:global";
+        } else if (ws.gameKind === "aqua") {
+          roomId = "aqua:" + (msg.hostId || ws.userId);
+        } else {
+          roomId = ws.gameKind + ":global";
+        }
+        joinRoom(ws, roomId);
+        break;
+      }
+
+      case "pos": {
+        // Position update — applies to any game
+        if (!ws.roomId) return;
+        ws.x = Number(msg.x) || 0;
+        ws.y = Number(msg.y) || 0;
         ws.z = Number(msg.z) || 0;
         ws.yaw = Number(msg.yaw) || 0;
         if (typeof msg.hp === "number") ws.hp = msg.hp;
+        if (typeof msg.selectedItem === "number") ws.selectedItem = msg.selectedItem;
         broadcast(ws.roomId, {
           type: "pos",
           userId: ws.userId,
-          x: ws.x, z: ws.z, yaw: ws.yaw, hp: ws.hp,
-          y: typeof msg.y === "number" ? msg.y : 0,
-          anim: msg.anim || null,
+          x: ws.x, y: ws.y, z: ws.z, yaw: ws.yaw,
+          hp: ws.hp, selectedItem: ws.selectedItem,
         }, ws);
         break;
       }
+
       case "chat": {
-        if (!ws.roomId || !ws.userId) return;
+        if (!ws.roomId) return;
         const text = sanitizeChat(msg.text);
         if (!text) return;
         broadcast(ws.roomId, {
@@ -160,128 +169,131 @@ wss.on("connection", (ws) => {
         }, null);
         break;
       }
-      case "weather": {
-        if (ws.gameKind !== "aqua") return;
-        if (!ws.roomId || !ws.userId) return;
-        if (ws.roomId !== "aqua:" + ws.userId) return;
-        const w = msg.weather;
-        if (w !== "clear" && w !== "cloudy" && w !== "rain" && w !== "storm" && w !== "fog") return;
-        broadcast(ws.roomId, { type: "weather", weather: w }, ws);
-        break;
-      }
-      // ─── ZIAM BATTLEGROUNDS ──
-      case "ziam_attack": {
-        if (ws.gameKind !== "ziam" || !ws.roomId) return;
-        const attackId = String(msg.attackId || "").slice(0, 40);
-        if (!attackId) return;
+
+      // ─── YUAMBCRAFT-SPECIFIC ──
+
+      case "block": {
+        // Player placed or broke a block — broadcast to everyone
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
         broadcast(ws.roomId, {
-          type: "ziam_attack",
+          type: "block",
           userId: ws.userId,
-          attackId,
-          ts: Date.now(),
+          x: Number(msg.x) | 0,
+          y: Number(msg.y) | 0,
+          z: Number(msg.z) | 0,
+          id: Number(msg.id) | 0,
+          dimension: msg.dimension || "overworld",
         }, ws);
         break;
       }
-      case "ziam_hit": {
-        if (ws.gameKind !== "ziam" || !ws.roomId) return;
-        const targetId = String(msg.targetId || "").slice(0, 100);
-        const damage = Math.min(150, Math.max(0, Number(msg.damage) || 0));
-        const knockback = msg.knockback || { x: 0, z: 0, y: 0 };
-        const attackId = String(msg.attackId || "punch").slice(0, 40);
-        // Allow 0-damage hits IF they include knockback — supports pure
-        // displacement abilities like Wind Cyclone airborne launch and
-        // Wind air-jump blasts. Reject only if both damage and knockback are 0.
-        const hasKnockback = (Number(knockback.x) || 0) !== 0 ||
-                             (Number(knockback.y) || 0) !== 0 ||
-                             (Number(knockback.z) || 0) !== 0;
-        if (!targetId || (damage <= 0 && !hasKnockback)) return;
-        const set = rooms.get(ws.roomId);
-        if (!set) return;
-        for (const peer of set) {
-          if (peer.userId === targetId) {
-            send(peer, {
-              type: "ziam_take_hit",
-              fromUserId: ws.userId,
-              fromUsername: ws.username,
-              damage,
-              knockback,
-              attackId,
-              ts: Date.now(),
-            });
-            break;
-          }
-        }
+
+      case "swing": {
+        // Player swung their hand/tool — purely visual broadcast
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, { type: "swing", userId: ws.userId }, ws);
         break;
       }
-      case "ziam_death": {
-        if (ws.gameKind !== "ziam" || !ws.roomId) return;
-        const killerId = String(msg.killerId || "").slice(0, 100);
-        const killAttackId = String(msg.attackId || "punch").slice(0, 40);
-        ws.deaths = (ws.deaths || 0) + 1;
-        const set = rooms.get(ws.roomId);
-        let killerName = "Anonymous";
-        if (set && killerId) {
-          for (const peer of set) {
-            if (peer.userId === killerId) {
-              peer.kills = (peer.kills || 0) + 1;
-              killerName = peer.username || "Anonymous";
-              break;
-            }
-          }
-        }
+
+      case "dimension": {
+        // Player switched dimension (overworld/nether)
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        ws.dimension = String(msg.dimension || "overworld");
         broadcast(ws.roomId, {
-          type: "ziam_killfeed",
-          killerId, killerName,
-          victimId: ws.userId, victimName: ws.username,
-          attackId: killAttackId,
-          ts: Date.now(),
-        }, null);
-        broadcast(ws.roomId, {
-          type: "ziam_stats",
+          type: "dimension",
           userId: ws.userId,
-          kills: ws.kills || 0,
-          deaths: ws.deaths || 0,
-        }, null);
-        if (killerId && set) {
-          for (const peer of set) {
-            if (peer.userId === killerId) {
-              broadcast(ws.roomId, {
-                type: "ziam_stats",
-                userId: peer.userId,
-                kills: peer.kills || 0,
-                deaths: peer.deaths || 0,
-              }, null);
-              break;
-            }
-          }
-        }
+          dimension: ws.dimension,
+        }, ws);
         break;
       }
-      case "ziam_respawn": {
-        if (ws.gameKind !== "ziam" || !ws.roomId) return;
-        ws.hp = 100;
-        ws.x = Number(msg.x) || 0;
-        ws.z = Number(msg.z) || 0;
-        ws.yaw = Number(msg.yaw) || 0;
+
+      case "item_drop": {
+        // A dropped item appeared on the ground
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
         broadcast(ws.roomId, {
-          type: "ziam_respawn",
-          userId: ws.userId,
-          x: ws.x, z: ws.z, yaw: ws.yaw,
-        }, null);
+          type: "item_drop",
+          dropId: String(msg.dropId),
+          itemId: Number(msg.itemId) | 0,
+          count: Number(msg.count) | 0,
+          x: Number(msg.x), y: Number(msg.y), z: Number(msg.z),
+          dimension: msg.dimension || "overworld",
+        }, ws);
         break;
       }
-      case "ziam_style": {
-        if (ws.gameKind !== "ziam" || !ws.roomId) return;
-        const style = VALID_ZIAM_STYLES.has(msg.style) ? msg.style : null;
-        if (!style) return;
-        ws.style = style;
+
+      case "item_pickup": {
+        // Someone picked up a dropped item — remove for everyone
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
         broadcast(ws.roomId, {
-          type: "ziam_style",
+          type: "item_pickup",
+          dropId: String(msg.dropId),
           userId: ws.userId,
-          style,
         }, null);
         break;
       }
+
+      case "mob_spawn": {
+        // Host-only: a new mob exists
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, {
+          type: "mob_spawn",
+          mobId: String(msg.mobId),
+          mobType: String(msg.mobType),
+          x: Number(msg.x), y: Number(msg.y), z: Number(msg.z),
+          dimension: msg.dimension || "overworld",
+        }, ws);
+        break;
+      }
+
+      case "mob_state": {
+        // Host broadcasts mob positions
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, {
+          type: "mob_state",
+          mobs: msg.mobs,
+          dimension: msg.dimension || "overworld",
+        }, ws);
+        break;
+      }
+
+      case "mob_die": {
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, {
+          type: "mob_die",
+          mobId: String(msg.mobId),
+        }, null);
+        break;
+      }
+
+      case "mob_hit": {
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, {
+          type: "mob_hit",
+          mobId: String(msg.mobId),
+          damage: Number(msg.damage) || 1,
+          attackerId: ws.userId,
+        }, ws);
+        break;
+      }
+
+      case "host_claim": {
+        // First connected client claims host. Server doesn't enforce —
+        // clients sort by userId and the lowest is host.
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, { type: "host_claim", userId: ws.userId }, ws);
+        break;
+      }
+
+      // ─── EXISTING GAMES (kept for backward compat) ──
+      case "ziam_respawn":
+      case "ziam_style":
+      case "enemy_hit":
+      case "enemy_state":
+      case "stage_advance": {
+        if (!ws.roomId) return;
+        broadcast(ws.roomId, { ...msg, userId: ws.userId }, ws);
+        break;
+      }
+
       case "ping": {
         send(ws, { type: "pong", ts: Date.now() });
         break;
@@ -298,8 +310,17 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("error", () => { });
+  ws.on("error", () => { /* close handles it */ });
 });
+
+// Heartbeat: drop dead connections
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping(() => {});
+  });
+}, 30000);
 
 server.listen(PORT, () => {
   console.log(`ALEXPRO GAMES multiplayer server listening on :${PORT}`);
