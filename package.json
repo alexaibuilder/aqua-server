@@ -1,13 +1,14 @@
 {
   "name": "aqua-server",
-  "version": "1.0.0",
-  "description": "WebSocket multiplayer server for Aqua Tycoon",
+  "version": "1.2.0",
+  "description": "ALEXPRO GAMES multiplayer server with persistent SMP world",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "@neondatabase/serverless": "^0.10.4"
   },
   "engines": {
     "node": ">=18.0.0"
