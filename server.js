@@ -488,6 +488,27 @@ wss.on("connection", (ws) => {
         break;
       }
 
+      // YUAMBCRAFT: host broadcasts day/night + weather
+      case "world_sync": {
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, {
+          type: "world_sync",
+          dayTime: Number(msg.dayTime) || 0,
+          weather: String(msg.weather || "clear"),
+        }, ws);
+        break;
+      }
+
+      // YUAMBCRAFT: admin lightning effect
+      case "lightning": {
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        broadcast(ws.roomId, {
+          type: "lightning",
+          x: Number(msg.x) || 0, y: Number(msg.y) || 0, z: Number(msg.z) || 0,
+        }, ws);
+        break;
+      }
+
       // YUAMBCRAFT: per-player save (in-memory)
       case "player_save": {
         if (ws.gameKind !== "yuambcraft" || !ws.userId) return;
