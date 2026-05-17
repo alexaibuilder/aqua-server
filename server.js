@@ -42,10 +42,39 @@ async function loadWorldFromDB() {
     `;
     const rows = await neonSql`SELECT data FROM yuambcraft_world ORDER BY id DESC LIMIT 1`;
     if (rows.length > 0 && rows[0].data && rows[0].data.blocks) {
+      let migratedCount = 0;
       for (const [key, id] of Object.entries(rows[0].data.blocks)) {
-        worldState.blockChanges.set(key, id);
+        // MIGRATION: detect leaked End blocks saved in overworld and move them to End dimension
+        const parts = key.split(",");
+        if (parts.length === 3) {
+          // Legacy key without dimension — assume overworld
+          parts.push("overworld");
+        }
+        const x = +parts[0], y = +parts[1], z = +parts[2];
+        let dim = parts[3];
+        // If block is in overworld but is an End-only block, migrate it
+        if (dim === "overworld") {
+          const bid = +id;
+          // End stone (70) and end crystal (73) only belong in End
+          const isEndOnly = (bid === 70 || bid === 73);
+          // Tall floating obsidian (id 20) above y=45 in End-pillar-ring distance from origin
+          const distFromOrigin = Math.sqrt(x * x + z * z);
+          const isFloatingObsidian = (bid === 20 && y > 45 && distFromOrigin < 50);
+          // End portal frame/portal above y=50 = leaked End structure (real one is at ground level)
+          const isFloatingPortal = ((bid === 71 || bid === 72) && y > 50);
+          if (isEndOnly || isFloatingObsidian || isFloatingPortal) {
+            dim = "end";
+            migratedCount++;
+          }
+        }
+        const newKey = x + "," + y + "," + z + "," + dim;
+        worldState.blockChanges.set(newKey, +id);
       }
       console.log("[smp] Loaded " + worldState.blockChanges.size + " block changes from DB");
+      if (migratedCount > 0) {
+        console.log("[smp] MIGRATED " + migratedCount + " leaked End blocks from overworld to End dimension");
+        worldState.dirty = true; // force save with corrected keys
+      }
     }
   } catch (e) {
     console.error("[smp] Error loading world:", e.message);
@@ -78,6 +107,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 loadWorldFromDB();
+loadPlayerDataFromDB();
 
 // ─── ROOMS ──
 const rooms = new Map();
@@ -89,6 +119,49 @@ const activeMatches = new Map();  // matchId -> { aWs, bWs, aId, bId, aHp, bHp, 
 // ─── PER-PLAYER SAVE (in-memory, wiped on Railway restart) ──
 // Keyed by userId. Stores last known position + inventory + vitals.
 const playerData = new Map();
+
+// Persist player saves to Neon so inventory survives Railway restarts
+async function loadPlayerDataFromDB() {
+  if (!neonSql) return;
+  try {
+    await neonSql`
+      CREATE TABLE IF NOT EXISTS yuambcraft_players (
+        user_id TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        saved_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    const rows = await neonSql`SELECT user_id, data FROM yuambcraft_players`;
+    for (const r of rows) {
+      playerData.set(r.user_id, r.data);
+    }
+    console.log("[smp] Loaded " + playerData.size + " player saves from DB");
+  } catch (e) {
+    console.error("[smp] Error loading players:", e.message);
+  }
+}
+
+let playerDataDirty = new Set(); // userIds that need saving
+async function savePlayerDataToDB() {
+  if (!neonSql) return;
+  if (playerDataDirty.size === 0) return;
+  const dirtyIds = Array.from(playerDataDirty);
+  playerDataDirty.clear();
+  for (const uid of dirtyIds) {
+    const d = playerData.get(uid);
+    if (!d) continue;
+    try {
+      await neonSql`
+        INSERT INTO yuambcraft_players (user_id, data, saved_at)
+        VALUES (${uid}, ${d}, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, saved_at = NOW()
+      `;
+    } catch (e) {
+      console.error("[smp] Error saving player " + uid + ":", e.message);
+    }
+  }
+}
+setInterval(savePlayerDataToDB, 15000);
 
 // ─── SMP FEATURES STATE ──
 // Leaderboard stats: userId -> { username, kills, blocks, golems, deaths }
@@ -300,7 +373,7 @@ wss.on("connection", (ws) => {
   ws.matchId = null;
   ws.on("pong", () => { ws.isAlive = true; });
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || typeof msg.type !== "string") return;
@@ -397,6 +470,26 @@ wss.on("connection", (ws) => {
         worldState.blockChanges.set(key, id);
         worldState.dirty = true;
         broadcast(ws.roomId, { type: "block", userId: ws.userId, x, y, z, id, dimension: dim }, ws);
+        break;
+      }
+
+      // ADMIN: wipe entire SMP world (for fixing dimension leaks etc)
+      case "clearworld": {
+        if (ws.gameKind !== "yuambcraft" || !ws.roomId) return;
+        // Only allow if client claims admin (basic trust — they need password to get this set)
+        if (msg.adminPassword !== "67issountuff") {
+          send(ws, { type: "system_message", text: "❌ Admin auth required" });
+          return;
+        }
+        worldState.blockChanges.clear();
+        worldState.dirty = true;
+        if (neonSql) {
+          try { await neonSql`DELETE FROM yuambcraft_world`; } catch {}
+        }
+        broadcast(ws.roomId, {
+          type: "system_message",
+          text: "🌍 SMP world wiped by admin — please rejoin",
+        });
         break;
       }
 
@@ -524,6 +617,7 @@ wss.on("connection", (ws) => {
           storage: Array.isArray(msg.storage) ? msg.storage : null,
           savedAt: Date.now(),
         });
+        playerDataDirty.add(ws.userId);
         break;
       }
 
